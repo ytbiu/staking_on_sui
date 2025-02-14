@@ -2,6 +2,7 @@ module reward_coin::reward_coin {
     use sui::coin::{Self, TreasuryCap, Coin};
     use sui::event;
 
+    const DECIMALS: u8 = 6;
     public struct REWARD_COIN has drop {}
 
     public struct MintEvent has copy, drop {
@@ -19,7 +20,7 @@ module reward_coin::reward_coin {
     ) {
         let (treasury, metadata) = coin::create_currency(
             witness,
-            6,
+            DECIMALS,
             b"RWDC",
             b"reward coin",
             b"reward coin for staking",

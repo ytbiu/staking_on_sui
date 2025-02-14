@@ -1,15 +1,56 @@
 /// Module: machine_staking
 module machine_staking::machine_staking {
 
-    use sui::balance::{ Balance };
-    use sui::coin::{Self, Coin};
     use reward_coin::reward_coin::{ REWARD_COIN };
-    use sui::clock::{Self, Clock};
     use staking_permission_nft::staking_permission_nft::{ STAKING_PERMISSION_NFT };
+
+    use sui::balance::{Self, Balance};
+    use sui::coin::{
+        Self,
+        Coin,
+        CoinMetadata,
+        TreasuryCap
+    };
+    use sui::clock::{Self, Clock};
+    use sui::table::{Self, Table};
+    use std::string::{ String };
+    use sui::event::{ Self };
+
+    const VERSION: u64 = 1;
+
     const ONE_DAY: u64 = 60 * 60 * 24;
-    // const REWARD_DURATION: u64 = ONE_DAY * 60; // 60 days
+    const REWARD_DURATION: u64 = ONE_DAY * 60; // 60 days
     // const MAX_NFTS_PER_MACHINE: u64 = 20;
     const LOCK_DURATION: u64 = ONE_DAY * 180; // 180 days
+
+    const BASE_RESERVE_AMOUT: u64 = 10000;
+    const ONE_DAY_RENT_FEE: u64 = 10000;
+
+    // Error
+    const MACHINE_STAKED_ERR: u64 = 0;
+    const MACHINE_NOT_STAKED_ERR: u64 = 1;
+    const DECIMALS_NOT_DEFINED_ERR: u64 = 2;
+    const CAN_NOT_UNSTAKE: u64 = 3;
+    const INVALID_RENT_FEE: u64 = 4;
+    const NOT_RENTER_ERR: u64 = 5;
+    const CAN_NOT_END_RENT: u64 = 6;
+
+    // Event
+    public struct UserStakeEvent has copy, drop {
+        user: address,
+        machine_id: String,
+    }
+
+    public struct RewardStartEvent has copy, drop {}
+
+    public struct ClaimedEvent has copy, drop {
+        machine_id: String,
+        total_claimed_reward: u64,
+    }
+
+    public struct UnstakeEvent has copy, drop {
+        machine_id: String,
+    }
 
     public struct RootCap has key {
         id: UID,
@@ -20,32 +61,49 @@ module machine_staking::machine_staking {
         reward_start_time: u64,
         reward_end_time: u64,
         reward_start_machine_count_threshold: u64,
-        base_reserve_amount: u64,
         total_distributed_reward_amount: u64,
         init_reward_amount: u64,
         total_machine_calc_point: u64,
         total_machine_count: u64,
-        // version: u64
+        total_reserve_coin_amount: u64,
+        stake_holder_machines: Table<address, Table<String, bool>>,
+        machine_2_calc_point: Table<String, u64>,
+        reward_coin_decimals: u8,
+        version: u64
     }
 
     public struct RewardPool has key {
         id: UID,
+        treasury_cap: TreasuryCap<REWARD_COIN>,
         balance: Balance<REWARD_COIN>
     }
 
     public struct UserStakeInfo has key {
         id: UID,
-        start_time: u64,
-        end_time: u64,
+        machine_id: String,
         staked_coin_balance: Balance<REWARD_COIN>,
         staked_nft_balance: Balance<STAKING_PERMISSION_NFT>,
-        locked_reward: LockedReward
     }
 
-    public struct LockedReward has store {
+    public struct RewardInfo has key, store {
+        id: UID,
+        machine_id: String,
+        claimed_reward: u64,
         locked_reward_balance: Balance<REWARD_COIN>,
         locked_time: u64,
         unlocked_time: u64,
+
+        last_claimed_time: u64,
+        start_time: u64,
+        end_time: u64
+    }
+
+    public struct RentInfo has key {
+        id: UID,
+        machine_id: String,
+        start_time: u64,
+        end_time: u64,
+        renter: address,
     }
 
     fun init(ctx: &mut TxContext) {
@@ -54,11 +112,16 @@ module machine_staking::machine_staking {
             reward_start_time: 0,
             reward_end_time: 0,
             reward_start_machine_count_threshold: 10,
-            base_reserve_amount: 10_000_000_000_000,
             total_distributed_reward_amount: 0,
             init_reward_amount: 0,
             total_machine_calc_point: 0,
-            total_machine_count: 0
+            total_machine_count: 0,
+            total_reserve_coin_amount: 0,
+            reward_coin_decimals: 0,
+            stake_holder_machines: table::new<address, Table<String, bool>>(ctx),
+            machine_2_calc_point: table::new<String, u64>(ctx),
+            version: VERSION
+
         };
         transfer::share_object(config);
 
@@ -72,47 +135,446 @@ module machine_staking::machine_staking {
         _: &RootCap,
         config: &mut Config,
         reward_start_machine_count_threshold: u64,
-        base_reserve_amount: u64
     ) {
         config.reward_start_machine_count_threshold = reward_start_machine_count_threshold;
-        config.base_reserve_amount = base_reserve_amount
     }
 
     public entry fun create_reward_pool(
         _: &RootCap,
         reward_coin: Coin<REWARD_COIN>,
+        treasury_cap: TreasuryCap<REWARD_COIN>,
+        coin_metadata: &CoinMetadata<REWARD_COIN>,
+        stake_config: &mut Config,
         ctx: &mut TxContext
     ) {
 
         let pool = RewardPool {
             id: object::new(ctx),
+            treasury_cap: treasury_cap,
             balance: coin::into_balance(reward_coin)
         };
+        stake_config.reward_coin_decimals = coin::get_decimals(coin_metadata);
         transfer::share_object(pool)
     }
 
     public entry fun stake(
+        machine_id: String,
+        origin_calc_point: u64,
+        stake_config: &mut Config,
         staked_coin: Coin<REWARD_COIN>,
         stake_for_seconds: u64,
         staked_nft: Coin<STAKING_PERMISSION_NFT>,
         clock: &Clock,
         ctx: &mut TxContext
     ) {
-        let now = clock::timestamp_ms(clock);
-        let user_stake_info = UserStakeInfo {
-            id: object::new(ctx),
-            start_time: now,
-            end_time: now + stake_for_seconds,
-            staked_coin_balance: coin::into_balance(staked_coin),
-            staked_nft_balance: coin::into_balance(staked_nft),
-            locked_reward: LockedReward {
-                locked_reward_balance: coin::into_balance(coin::zero(ctx)),
-                locked_time: now,
-                unlocked_time: now + LOCK_DURATION,
+
+        let calc_point = get_full_calc_point(
+            origin_calc_point,
+            coin::value(&staked_coin),
+            coin::value(&staked_nft),
+            stake_config,
+        );
+
+        stake_config.total_machine_calc_point = stake_config.total_machine_calc_point + calc_point;
+        stake_config.total_machine_count = stake_config.total_machine_count + 1;
+        add_staking_machine(
+            machine_id,
+            stake_config,
+            calc_point,
+            ctx
+        );
+
+        let user_stake_info = new_user_stake_info(
+            machine_id,
+            staked_coin,
+            staked_nft,
+            ctx
+        );
+
+        transfer::transfer(user_stake_info, ctx.sender());
+
+        let reward_info = new_reward_info(
+            machine_id,
+            stake_for_seconds,
+            clock,
+            ctx
+        );
+        transfer::transfer(reward_info, ctx.sender());
+
+        event::emit(
+            UserStakeEvent {
+                user: ctx.sender(),
+                machine_id: machine_id
             }
+        );
+
+        if (stake_config.total_machine_count >= stake_config.reward_start_machine_count_threshold) {
+            let now = clock::timestamp_ms(clock);
+            stake_config.reward_start_time = now;
+            stake_config.reward_end_time = now + REWARD_DURATION;
+            event::emit(RewardStartEvent {});
+        };
+    }
+
+    public entry fun claim(
+        stake_config: &mut Config,
+        mut reward_info: RewardInfo,
+        reward_pool: &mut RewardPool,
+        clock: &Clock,
+        ctx: &mut TxContext
+    ) {
+        let reward = get_reward(stake_config, &reward_info);
+        let (rateA, rateB) = release_reward_right_now_rate();
+        let released_reward = reward * rateA / rateB;
+
+        let locked_reward = reward - released_reward;
+        let locked_reward_balance = reward_pool.balance.split(locked_reward);
+
+        let _ = reward_info.locked_reward_balance.join(locked_reward_balance);
+
+        let mut released_reward_balance = reward_pool.balance.split(released_reward);
+        reward_info.claimed_reward = reward_info.claimed_reward + released_reward_balance.
+            value();
+        stake_config.total_distributed_reward_amount = stake_config.total_distributed_reward_amount
+            + released_reward_balance.value();
+
+        reward_info.last_claimed_time = clock::timestamp_ms(clock);
+        let (
+            release_before_locked_reward,
+            withdrawed_all
+        ) = withdraw_locked_reward(&mut reward_info, clock);
+        let _ = released_reward_balance.join(release_before_locked_reward);
+        let machine_id = reward_info.machine_id;
+        if (withdrawed_all) {
+            delete_reward_info(reward_info);
+        } else {
+            transfer::public_transfer(reward_info, ctx.sender());
         };
 
-        transfer::transfer(user_stake_info, ctx.sender())
+        let total_released = released_reward_balance.value();
+        transfer::public_transfer(
+            released_reward_balance.into_coin(ctx),
+            ctx.sender()
+        );
+
+        event::emit(
+            ClaimedEvent {
+                machine_id: machine_id,
+                total_claimed_reward: total_released,
+            }
+        );
+    }
+
+    public entry fun unstake(
+        stake_config: &mut Config,
+        mut user_stake_info: UserStakeInfo,
+        reward_info: RewardInfo,
+        reward_pool: &mut RewardPool,
+        clock: &Clock,
+        ctx: &mut TxContext
+    ) {
+
+        let now = clock::timestamp_ms(clock);
+        assert!(
+            reward_info.end_time <= now,
+            CAN_NOT_UNSTAKE
+        );
+
+        let machine_id = reward_info.machine_id;
+        let machine_calc_point = table::borrow(
+            &stake_config.machine_2_calc_point,
+            machine_id
+        );
+
+        stake_config.total_machine_calc_point = stake_config.total_machine_calc_point - *machine_calc_point;
+        stake_config.total_machine_count = stake_config.total_machine_count - 1;
+        stake_config.total_reserve_coin_amount = stake_config.total_reserve_coin_amount - user_stake_info
+            .staked_coin_balance.value();
+        claim(
+            stake_config,
+            reward_info,
+            reward_pool,
+            clock,
+            ctx
+        );
+
+        table::remove(
+            &mut stake_config.machine_2_calc_point,
+            machine_id
+        );
+
+        if (user_stake_info.staked_coin_balance.value() > 0) {
+            let reserved_coin = user_stake_info.staked_coin_balance.withdraw_all().into_coin(
+                ctx
+            );
+            transfer::public_transfer(reserved_coin, ctx.sender())
+        };
+
+        let reserved_nft = user_stake_info.staked_nft_balance.withdraw_all().into_coin(ctx);
+        transfer::public_transfer(reserved_nft, ctx.sender());
+
+        remove_staking_machine(
+            user_stake_info.machine_id,
+            stake_config,
+            ctx
+        );
+
+        event::emit(
+            UnstakeEvent {
+                machine_id: user_stake_info.machine_id
+            }
+        );
+
+        delete_user_stake_info(user_stake_info)
+    }
+
+    fun get_reward(
+        stake_config: &Config,
+        reward_info: &RewardInfo,
+    ): u64 {
+        assert!(reward_started(stake_config));
+
+        let end_time = reward_info.end_time.min(stake_config.reward_end_time);
+
+        let mut start_time = reward_info.last_claimed_time.max(
+            stake_config.reward_start_time
+        );
+
+        start_time = start_time.min(end_time);
+
+        let total_duration_reward = stake_config.init_reward_amount * (end_time - start_time)
+            / REWARD_DURATION;
+
+        let machine_calc_point = table::borrow(
+            &stake_config.machine_2_calc_point,
+            reward_info.machine_id
+        );
+        total_duration_reward *(*machine_calc_point) / stake_config.total_machine_calc_point
+    }
+
+    fun get_full_calc_point(
+        origin_calc_point: u64,
+        staked_coin_value: u64,
+        staked_nft_value: u64,
+        stake_config: &Config
+    ): u64 {
+        assert!(
+            stake_config.reward_coin_decimals > 0,
+            DECIMALS_NOT_DEFINED_ERR
+        );
+        let staked_coin_value = staked_coin_value.max(
+            BASE_RESERVE_AMOUT * (
+                stake_config.reward_coin_decimals as u64
+            )
+        );
+
+        origin_calc_point * (
+            staked_nft_value + staked_coin_value / BASE_RESERVE_AMOUT
+        )
+    }
+
+    fun new_user_stake_info(
+        machine_id: String,
+        staked_coin: Coin<REWARD_COIN>,
+        staked_nft: Coin<STAKING_PERMISSION_NFT>,
+        ctx: &mut TxContext
+    ): UserStakeInfo {
+        UserStakeInfo {
+            id: object::new(ctx),
+            machine_id: machine_id,
+            staked_coin_balance: coin::into_balance(staked_coin),
+            staked_nft_balance: coin::into_balance(staked_nft),
+        }
+    }
+
+    fun new_reward_info(
+        machine_id: String,
+        stake_for_seconds: u64,
+        clock: &Clock,
+        ctx: &mut TxContext
+    ): RewardInfo {
+        let now = clock::timestamp_ms(clock);
+        RewardInfo {
+            id: object::new(ctx),
+            machine_id: machine_id,
+            claimed_reward: 0,
+            locked_reward_balance: coin::into_balance(coin::zero(ctx)),
+            locked_time: now,
+            unlocked_time: now + LOCK_DURATION,
+            last_claimed_time: now,
+            start_time: now,
+            end_time: now + stake_for_seconds
+        }
+    }
+
+    fun add_staking_machine(
+        machine_id: String,
+        stake_config: &mut Config,
+        calc_point: u64,
+        ctx: &TxContext
+    ) {
+        let machines = table::borrow_mut<address, Table<String, bool>>(
+            &mut stake_config.stake_holder_machines,
+            ctx.sender()
+        );
+
+        assert!(
+            !table::contains(machines, machine_id),
+            MACHINE_STAKED_ERR
+        );
+
+        table::add(machines, machine_id, true);
+        table::add(
+            &mut stake_config.machine_2_calc_point,
+            machine_id,
+            calc_point
+        );
+    }
+
+    fun remove_staking_machine(
+        machine_id: String,
+        stake_config: &mut Config,
+        ctx: &TxContext
+    ) {
+        let machines = table::borrow_mut<address, Table<String, bool>>(
+            &mut stake_config.stake_holder_machines,
+            ctx.sender()
+        );
+
+        assert!(
+            table::contains(machines, machine_id),
+            MACHINE_NOT_STAKED_ERR
+        );
+
+        table::remove(machines, machine_id);
+    }
+
+    fun reward_started(stake_config: &Config): bool {
+        stake_config.reward_start_time > 0
+    }
+
+    fun release_reward_right_now_rate(): (u64, u64) {
+        (1, 10)
+    }
+
+    fun withdraw_locked_reward(
+        reward_info: &mut RewardInfo,
+        clock: &Clock
+    ): (Balance<REWARD_COIN>, bool) {
+        let now = clock::timestamp_ms(clock);
+        if (reward_info.unlocked_time >= now) {
+            let balance = reward_info.locked_reward_balance.withdraw_all();
+            return(balance, true)
+        };
+        let release_amount = reward_info.locked_reward_balance.value() * (
+            now - reward_info.locked_time
+        ) / LOCK_DURATION;
+        (
+            reward_info.locked_reward_balance.split(release_amount),
+            false
+        )
+    }
+
+    fun delete_reward_info(reward_info: RewardInfo) {
+        let RewardInfo {
+            id: id,
+            machine_id: _,
+            claimed_reward: _,
+            locked_reward_balance: locked_reward_balance,
+            locked_time: _,
+            unlocked_time: _,
+            last_claimed_time: _,
+            start_time: _,
+            end_time: _,
+        } = reward_info;
+        object::delete(id);
+        balance::destroy_zero(locked_reward_balance)
+    }
+
+    fun delete_user_stake_info(user_stake_info: UserStakeInfo) {
+        let UserStakeInfo {
+            id: id,
+            machine_id: _,
+            staked_coin_balance: staked_coin_balance,
+            staked_nft_balance: staked_nft_balance
+        } = user_stake_info;
+        object::delete(id);
+        balance::destroy_zero(staked_coin_balance);
+        balance::destroy_zero(staked_nft_balance)
+    }
+
+    public entry fun rent_machine(
+        reward_pool: &mut RewardPool,
+        config: &mut Config,
+        machine_id: String,
+        rent_duration_seconds: u64,
+        renter: address,
+        rent_fee: Coin<REWARD_COIN>,
+        fee_token_metadata: &CoinMetadata<REWARD_COIN>,
+        clock: &Clock,
+        ctx: &mut TxContext
+    ) {
+        assert!(rent_duration_seconds > ONE_DAY);
+        let rent_days = rent_duration_seconds / ONE_DAY;
+        let expect_rent_fee = rent_days * ONE_DAY_RENT_FEE * (
+            coin::get_decimals(fee_token_metadata) as u64
+        );
+        assert!(
+            rent_fee.value() == expect_rent_fee,
+            INVALID_RENT_FEE
+        );
+        let now = clock::timestamp_ms(clock);
+
+        let rent_info = RentInfo {
+            id: object::new(ctx),
+            machine_id,
+            start_time: now,
+            end_time: now + rent_duration_seconds,
+            renter,
+        };
+
+        transfer::transfer(rent_info, ctx.sender());
+        let calc_point = table::borrow_mut(
+            &mut config.machine_2_calc_point,
+            machine_id
+        );
+
+        coin::burn(
+            &mut reward_pool.treasury_cap,
+            rent_fee
+        );
+        *calc_point = *calc_point * 13 / 10;
+    }
+
+    public entry fun end_rent_machine(
+        config: &mut Config,
+        machine_id: String,
+        rent_info: RentInfo,
+        clock: &Clock,
+        ctx: &mut TxContext
+    ) {
+        let now = clock::timestamp_ms(clock);
+        assert!(
+            rent_info.end_time <= now,
+            CAN_NOT_END_RENT
+        );
+        assert!(
+            rent_info.renter == ctx.sender(),
+            NOT_RENTER_ERR
+        );
+        let RentInfo {
+            id: id,
+            machine_id: _,
+            start_time: _,
+            end_time: _,
+            renter: _,
+        } = rent_info;
+        object::delete(id);
+        let calc_point = table::borrow_mut(
+            &mut config.machine_2_calc_point,
+            machine_id
+        );
+        *calc_point = *calc_point * 13 / 10;
     }
 
 }
