@@ -24,16 +24,12 @@ module machine_staking::machine_staking {
     const LOCK_DURATION: u64 = ONE_DAY * 180; // 180 days
 
     const BASE_RESERVE_AMOUT: u64 = 10000;
-    const ONE_DAY_RENT_FEE: u64 = 10000;
 
     // Error
     const MACHINE_STAKED_ERR: u64 = 0;
     const MACHINE_NOT_STAKED_ERR: u64 = 1;
     const DECIMALS_NOT_DEFINED_ERR: u64 = 2;
     const CAN_NOT_UNSTAKE: u64 = 3;
-    const INVALID_RENT_FEE: u64 = 4;
-    const NOT_RENTER_ERR: u64 = 5;
-    const CAN_NOT_END_RENT: u64 = 6;
 
     // Event
     public struct UserStakeEvent has copy, drop {
@@ -96,14 +92,6 @@ module machine_staking::machine_staking {
         last_claimed_time: u64,
         start_time: u64,
         end_time: u64
-    }
-
-    public struct RentInfo has key {
-        id: UID,
-        machine_id: String,
-        start_time: u64,
-        end_time: u64,
-        renter: address,
     }
 
     fun init(ctx: &mut TxContext) {
@@ -503,78 +491,32 @@ module machine_staking::machine_staking {
         balance::destroy_zero(staked_nft_balance)
     }
 
-    public entry fun rent_machine(
+    public fun update_calc_point_on_renting(
+        config: &mut Config,
+        machine_id: String
+    ) {
+        let calc_point = table::borrow_mut(
+            &mut config.machine_2_calc_point,
+            machine_id
+        );
+        *calc_point = *calc_point * 13 / 10;
+    }
+
+    public fun update_calc_point_on_end_renting(
+        config: &mut Config,
+        machine_id: String
+    ) {
+        let calc_point = table::borrow_mut(
+            &mut config.machine_2_calc_point,
+            machine_id
+        );
+        *calc_point = *calc_point * 10 / 13;
+    }
+
+    public fun burn(
         reward_pool: &mut RewardPool,
-        config: &mut Config,
-        machine_id: String,
-        rent_duration_seconds: u64,
-        renter: address,
-        rent_fee: Coin<REWARD_COIN>,
-        fee_token_metadata: &CoinMetadata<REWARD_COIN>,
-        clock: &Clock,
-        ctx: &mut TxContext
+        coin: Coin<REWARD_COIN>
     ) {
-        assert!(rent_duration_seconds > ONE_DAY);
-        let rent_days = rent_duration_seconds / ONE_DAY;
-        let expect_rent_fee = rent_days * ONE_DAY_RENT_FEE * (
-            coin::get_decimals(fee_token_metadata) as u64
-        );
-        assert!(
-            rent_fee.value() == expect_rent_fee,
-            INVALID_RENT_FEE
-        );
-        let now = clock::timestamp_ms(clock);
-
-        let rent_info = RentInfo {
-            id: object::new(ctx),
-            machine_id,
-            start_time: now,
-            end_time: now + rent_duration_seconds,
-            renter,
-        };
-
-        transfer::transfer(rent_info, ctx.sender());
-        let calc_point = table::borrow_mut(
-            &mut config.machine_2_calc_point,
-            machine_id
-        );
-
-        coin::burn(
-            &mut reward_pool.treasury_cap,
-            rent_fee
-        );
-        *calc_point = *calc_point * 13 / 10;
+        coin::burn(&mut reward_pool.treasury_cap, coin);
     }
-
-    public entry fun end_rent_machine(
-        config: &mut Config,
-        machine_id: String,
-        rent_info: RentInfo,
-        clock: &Clock,
-        ctx: &mut TxContext
-    ) {
-        let now = clock::timestamp_ms(clock);
-        assert!(
-            rent_info.end_time <= now,
-            CAN_NOT_END_RENT
-        );
-        assert!(
-            rent_info.renter == ctx.sender(),
-            NOT_RENTER_ERR
-        );
-        let RentInfo {
-            id: id,
-            machine_id: _,
-            start_time: _,
-            end_time: _,
-            renter: _,
-        } = rent_info;
-        object::delete(id);
-        let calc_point = table::borrow_mut(
-            &mut config.machine_2_calc_point,
-            machine_id
-        );
-        *calc_point = *calc_point * 13 / 10;
-    }
-
 }
