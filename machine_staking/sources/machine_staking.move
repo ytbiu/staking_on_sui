@@ -1,9 +1,6 @@
 /// Module: machine_staking
 module machine_staking::machine_staking {
 
-    use reward_coin::reward_coin::{ REWARD_COIN };
-    use staking_permission_nft::staking_permission_nft::{ STAKING_PERMISSION_NFT };
-
     use sui::balance::{Self, Balance};
     use sui::coin::{
         Self,
@@ -14,13 +11,22 @@ module machine_staking::machine_staking {
     use sui::clock::{Self, Clock};
     use sui::table::{Self, Table};
     use std::string::{ String };
-    use sui::event::{ Self };
+
+    use reward_coin::reward_coin::{ REWARD_COIN };
+    use staking_permission_nft::staking_permission_nft::{ STAKING_PERMISSION_NFT };
+
+    use machine_staking::events::{
+        user_stake_event,
+        claimed_event,
+        unstake_event,
+        reward_start_event,
+    };
 
     const VERSION: u64 = 1;
 
     const ONE_DAY: u64 = 60 * 60 * 24;
     const REWARD_DURATION: u64 = ONE_DAY * 60; // 60 days
-    // const MAX_NFTS_PER_MACHINE: u64 = 20;
+    const MAX_NFTS_PER_MACHINE: u64 = 20;
     const LOCK_DURATION: u64 = ONE_DAY * 180; // 180 days
 
     const BASE_RESERVE_AMOUT: u64 = 10000;
@@ -30,23 +36,7 @@ module machine_staking::machine_staking {
     const MACHINE_NOT_STAKED_ERR: u64 = 1;
     const DECIMALS_NOT_DEFINED_ERR: u64 = 2;
     const CAN_NOT_UNSTAKE: u64 = 3;
-
-    // Event
-    public struct UserStakeEvent has copy, drop {
-        user: address,
-        machine_id: String,
-    }
-
-    public struct RewardStartEvent has copy, drop {}
-
-    public struct ClaimedEvent has copy, drop {
-        machine_id: String,
-        total_claimed_reward: u64,
-    }
-
-    public struct UnstakeEvent has copy, drop {
-        machine_id: String,
-    }
+    const TOO_MANY_NFT: u64 = 4;
 
     public struct RootCap has key {
         id: UID,
@@ -119,7 +109,7 @@ module machine_staking::machine_staking {
         )
     }
 
-    entry fun set_config(
+    public entry fun set_config(
         _: &RootCap,
         config: &mut Config,
         reward_start_machine_count_threshold: u64,
@@ -156,6 +146,10 @@ module machine_staking::machine_staking {
         ctx: &mut TxContext
     ) {
 
+        assert!(
+            staked_nft.value() <= MAX_NFTS_PER_MACHINE,
+            TOO_MANY_NFT
+        );
         let calc_point = get_full_calc_point(
             origin_calc_point,
             coin::value(&staked_coin),
@@ -188,19 +182,13 @@ module machine_staking::machine_staking {
             ctx
         );
         transfer::transfer(reward_info, ctx.sender());
-
-        event::emit(
-            UserStakeEvent {
-                user: ctx.sender(),
-                machine_id: machine_id
-            }
-        );
+        user_stake_event(ctx.sender(), machine_id,);
 
         if (stake_config.total_machine_count >= stake_config.reward_start_machine_count_threshold) {
             let now = clock::timestamp_ms(clock);
             stake_config.reward_start_time = now;
             stake_config.reward_end_time = now + REWARD_DURATION;
-            event::emit(RewardStartEvent {});
+            reward_start_event();
         };
     }
 
@@ -245,12 +233,7 @@ module machine_staking::machine_staking {
             ctx.sender()
         );
 
-        event::emit(
-            ClaimedEvent {
-                machine_id: machine_id,
-                total_claimed_reward: total_released,
-            }
-        );
+        claimed_event(machine_id, total_released);
     }
 
     public entry fun unstake(
@@ -307,12 +290,7 @@ module machine_staking::machine_staking {
             ctx
         );
 
-        event::emit(
-            UnstakeEvent {
-                machine_id: user_stake_info.machine_id
-            }
-        );
-
+        unstake_event(user_stake_info.machine_id);
         delete_user_stake_info(user_stake_info)
     }
 

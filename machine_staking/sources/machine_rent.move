@@ -1,10 +1,14 @@
 module machine_staking::machine_rent {
-    use reward_coin::reward_coin::{ REWARD_COIN };
-
     use sui::coin::{Self, Coin, CoinMetadata,};
     use sui::clock::{Self, Clock};
     use std::string::{ String };
-    use sui::event::{ Self };
+
+    use reward_coin::reward_coin::{ REWARD_COIN };
+
+    use machine_staking::events::{
+        rent_machine_event,
+        end_rent_machine_event
+    };
 
     use machine_staking::machine_staking::{
         RewardPool,
@@ -12,29 +16,15 @@ module machine_staking::machine_rent {
         update_calc_point_on_renting,
         update_calc_point_on_end_renting,
         burn,
-
     };
 
     const ONE_DAY: u64 = 60 * 60 * 24;
     const ONE_DAY_RENT_FEE: u64 = 10000;
 
     // Error
-    const INVALID_RENT_FEE: u64 = 4;
-    const NOT_RENTER_ERR: u64 = 5;
-    const CAN_NOT_END_RENT: u64 = 6;
-
-    // Event
-    public struct RentMachineEvent has copy, drop {
-        machine_id: String,
-        rent_duration_seconds: u64,
-        rent_fee: u64,
-        renter: address,
-    }
-
-    public struct EndRentMachineEvent has copy, drop {
-        machine_id: String,
-        renter: address,
-    }
+    const INVALID_RENT_FEE: u64 = 101;
+    const NOT_RENTER_ERR: u64 = 102;
+    const CAN_NOT_END_RENT: u64 = 103;
 
     public struct RentInfo has key {
         id: UID,
@@ -78,13 +68,11 @@ module machine_staking::machine_rent {
 
         update_calc_point_on_end_renting(config, machine_id);
 
-        event::emit(
-            RentMachineEvent {
-                machine_id,
-                rent_duration_seconds,
-                rent_fee: rent_fee.value(),
-                renter,
-            }
+        rent_machine_event(
+            machine_id,
+            rent_duration_seconds,
+            rent_fee.value(),
+            renter
         );
         burn(reward_pool, rent_fee);
 
@@ -116,11 +104,6 @@ module machine_staking::machine_rent {
         object::delete(id);
 
         update_calc_point_on_renting(config, machine_id);
-        event::emit(
-            EndRentMachineEvent {
-                machine_id,
-                renter: ctx.sender(),
-            }
-        );
+        end_rent_machine_event(machine_id, ctx.sender());
     }
 }
